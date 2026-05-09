@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CheckOn Admin</title>
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+    <!-- 🔥 추가: Draw 플러그인 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css"/>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+
+    <style>
+        body { margin: 0; }
+
+        #info {
+            padding: 10px;
+            font-weight: bold;
+        }
+
+        #map {
+            height: 90vh;
+            width: 100%;
+        }
+
+        #panel {
+            position: fixed;
+            right: 0;
+            top: 0;
+            width: 340px;
+            height: 100%;
+            background: #fff;
+            border-left: 1px solid #ccc;
+            padding: 10px;
+            overflow-y: auto;
+            display: none;
+            z-index: 9999;
+        }
+
+        button {
+            margin: 5px 0;
+            padding: 8px;
+            width: 100%;
+        }
+    </style>
+</head>
+
+<body>
+
+<div id="info">
+    활성 기사 수: <span id="count">0</span>
+</div>
+
+<div id="map"></div>
+
+<div id="panel">
+    <h3 id="p_name">기사</h3>
+
+    <div id="p_status"></div>
+    <div id="p_last"></div>
+
+    <div id="p_point"></div>
+    <div id="p_daily"></div>
+    <div id="p_distance"></div>
+    <div id="p_gps"></div>
+
+    <hr>
+
+    <button onclick="loadToday()">📅 오늘 정산</button>
+    <button onclick="loadMonth()">📆 월 정산</button>
+    <button onclick="settle()">💰 월 정산 초기화</button>
+
+    <hr>
+
+    <h4>이동 기록</h4>
+    <div id="p_history"></div>
+</div>
+
+<script>
+
+let map = L.map('map').setView([37.5665, 126.9780], 13);
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap'
+}).addTo(map);
+
+// =========================
+// 데이터
+// =========================
+let markers = {};
+let pointsData = {};
+let dailyData = {};
+let statusData = {};
+let distanceData = {};
+let zoneState = {}; // 🔥 기사별 현재 구역 상태
+
+
+// =========================
+// 🔥 구역 데이터
+// =========================
+let zones = [];
+
+// =========================
+// Draw Control (구역 그리기)
+// =========================
+let drawnItems = new L.FeatureGroup();
+map.addLayer(drawnItems);
+
+let drawControl = new L.Control.Draw({
+    draw: {
+        polygon: true,
+        rectangle: true,
+        circle: false,
+        marker: false,
+        polyline: false,
+        circlemarker: false
+    },
+    edit: {
+        featureGroup: drawnItems
+    }
+});
+map.addControl(drawControl);
+
+// =========================
+// 구역 저장
+// =========================
+map.on(L.Draw.Event.CREATED, function (e) {
+
+    let layer = e.layer;
+
+    let zoneId = Date.now() + "_" + Math.random();
+
+    layer.zoneId = zoneId;
+
+    drawnItems.addLayer(layer);
+
+    zones.push({
+        id: zoneId,
+        layer: layer
+    });
+
+    alert("구역 생성 완료");
+});
+
+// =========================
+// point in polygon (핵심)
+// =========================
+function isInside(lat, lng, layer) {
+
+    let points = layer.getLatLngs()[0];
+    let x = lng, y = lat;
+
+    let inside = false;
+
+    for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+
+        let xi = points[i].lng, yi = points[i].lat;
+        let xj = points[j].lng, yj = points[j].lat;
+
+        let intersect = ((yi > y) != (yj > y)) &&
+            (x < (xj - xi) * (y - yi) / (yj - yi + 0.0000001) + xi);
+
+        if (intersect) inside = !inside;
+    }
+
+    return inside;
+}
+
+// =========================
+// 구역 감지 알림
+// =========================
+function checkZones(id, lat, lng) {
+
+    let currentZone = null;
+
+    for (let z of zones) {
+
+        if (isInside(lat, lng, z.layer)) {
+            currentZone = z.id;
+            break;
+        }
+    }
+
+    let prevZone = zoneState[id];
+
+    if (prevZone !== currentZone) {
+
+        zoneState[id] = currentZone;
+
+        if (currentZone) {
+            alert("🚨 " + id + " 구역 진입!");
+        } else if (prevZone) {
+            alert("🚪 " + id + " 구역 이탈!");
+        }
+    }
+}
+
+// =========================
+// 데이터 로딩
+// =========================
+async function loadAllData() {
+
+    try {
+        const [p, d, s, dist] = await Promise.all([
+            fetch("/points").then(r => r.json()),
+            fetch("/daily_points").then(r => r.json()),
+            fetch("/status").then(r => r.json()),
+            fetch("/distance").then(r => r.json())
+        ]);
+
+        pointsData = p || {};
+        dailyData = d || {};
+        statusData = s || {};
+        distanceData = dist || {};
+
+    } catch (e) {
+        console.log("data load error:", e);
+    }
+}
+
+// =========================
+// 상세 패널
+// =========================
+function loadDetail(id) {
+
+    document.getElementById("panel").style.display = "block";
+
+    let point = pointsData[id] || 0;
+    let daily = dailyData[id] || 0;
+    let dist = distanceData[id] ? distanceData[id].toFixed(2) : 0;
+
+    let status = statusData[id];
+
+    let online = "🔴 OFFLINE";
+    let last = "-";
+
+    if (status) {
+        online = status.online ? "🟢 ONLINE" : "🔴 OFFLINE";
+        last = status.last_seen || "-";
+    }
+
+    document.getElementById("p_name").innerText = "기사: " + id;
+    document.getElementById("p_status").innerText = "상태: " + online;
+    document.getElementById("p_last").innerText = "마지막 접속: " + last;
+
+    document.getElementById("p_point").innerText = "총 포인트: " + point + "원";
+    document.getElementById("p_daily").innerText = "오늘 포인트: " + daily + "원";
+    document.getElementById("p_distance").innerText = "이동거리: " + dist + " km";
+
+    fetch("/positions")
+        .then(r => r.json())
+        .then(data => {
+            let pos = data[id];
+            if (pos && pos.lat && pos.lon) {
+                document.getElementById("p_gps").innerText =
+                    "GPS: " + pos.lat.toFixed(5) + ", " + pos.lon.toFixed(5);
+            }
+        });
+}
+
+// =========================
+// 지도 업데이트
+// =========================
+async function updateMap() {
+
+    await loadAllData();
+
+    fetch("/positions")
+        .then(r => r.json())
+        .then(data => {
+
+            document.getElementById("count").innerText =
+                Object.keys(data).length;
+
+            for (let id in data) {
+
+                let pos = data[id];
+                if (!pos) continue;
+
+                let point = pointsData[id] || 0;
+
+                let status = statusData[id];
+                let online = status && status.online ? "🟢" : "🔴";
+
+                let popup =
+                    "기사: " + id + "<br>" +
+                    "상태: " + online + "<br>" +
+                    "포인트: " + point + "원<br>" +
+                    "GPS: " + pos.lat.toFixed(5) + ", " + pos.lon.toFixed(5);
+
+                // 🔥 구역 체크 추가
+                checkZones(id, pos.lat, pos.lon);
+
+                if (!markers[id]) {
+
+                    markers[id] = L.marker([pos.lat, pos.lon])
+                        .addTo(map)
+                        .bindPopup(popup)
+                        .on("click", () => loadDetail(id));
+
+                } else {
+
+                    markers[id]
+                        .setLatLng([pos.lat, pos.lon])
+                        .setPopupContent(popup);
+                }
+            }
+        });
+}
+
+// =========================
+// 실행
+// =========================
+setInterval(updateMap, 5000);
+updateMap();
+
+function settle() {
+
+    if (!confirm("정말 월 정산 초기화 할까요?")) {
+        return;
+    }
+
+    fetch("/reset_month", { method: "POST" })
+        .then(res => res.json())
+        .then(res => {
+
+            if (res.status === "ok") {
+                alert("✅ 월 정산 초기화 완료");
+
+                updateMap(); // 화면 갱신
+            } else {
+                alert("❌ 초기화 실패");
+            }
+        })
+        .catch(err => {
+            console.log(err);
+            alert("🚨 서버 오류");
+        });
+}
+
+</script>
+
+</body>
+</html>
